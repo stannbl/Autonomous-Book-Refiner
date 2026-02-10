@@ -55,10 +55,28 @@ class AdvancedImageProcessor:
             pdf_mapping[i]["end_page"] = pdf_mapping[i + 1]["start_page"] if i + 1 < len(pdf_mapping) else len(doc)
         return pdf_mapping
 
+    def get_vector_clusters(self, page):
+        """Groups drawing paths into logical figure boxes."""
+        paths = page.get_drawings()
+        clusters = []
+        for p in paths:
+            r = fitz.Rect(p["rect"])
+            if r.width < 5 or r.height < 5: continue
+
+            merged = False
+            for i, c_rect in enumerate(clusters):
+                # Manual expansion for intersection check (fixes AttributeError)
+                check_rect = fitz.Rect(c_rect.x0 - 20, c_rect.y0 - 20, c_rect.x1 + 20, c_rect.y1 + 20)
+                if r.intersects(check_rect):
+                    clusters[i] = c_rect | r
+                    merged = True
+                    break
+            if not merged: clusters.append(r)
+        return [c for c in clusters if c.width > 40]
+
     def extract_visual(self, page, bbox, fig_id):
         """Prioritizes SVG for vector visuals, falls back to PNG."""
         img_name = f"fig_{fig_id.replace('.', '_')}"
-
         if self.use_svg:
             try:
                 svg_data = page.get_svg_image(matrix=fitz.Identity, clip=bbox)
@@ -81,9 +99,10 @@ class AdvancedImageProcessor:
         mapping = self.find_chapter_starts(doc, md_files)
         fig_regex = re.compile(r'(?:Figure|Fig)\s*(\d+[\.\-]\d+)', re.IGNORECASE)
 
-        print(f"\n--- EXTRACTING VISUALS ---")
+        print(f"\n--- EXTRACTING VISUALS (ANTI-WATERMARK MODE) ---")
         for item in mapping:
-            with open(self.md_dir / item['file'], 'r', encoding='utf-8') as f:
+            md_path = self.md_dir / item['file']
+            with open(md_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
             fig_hooks = {}
@@ -92,24 +111,43 @@ class AdvancedImageProcessor:
                 matches = fig_regex.findall(page.get_text())
                 if not matches: continue
 
-                img_info = page.get_image_info()
+                # HYBRID CANDIDATE COLLECTION
+                candidates = []
+                max_candidate_area = 0
+                for img in page.get_image_info():
+                    r = fitz.Rect(img['bbox'])
+                    area = r.width * r.height
+                    max_candidate_area = max(max_candidate_area, area)
+                    candidates.append({'bbox': r, 'type': 'raster', 'area': area})
+                for vec_rect in self.get_vector_clusters(page):
+                    area = vec_rect.width * vec_rect.height
+                    max_candidate_area = max(max_candidate_area, area)
+                    candidates.append({'bbox': vec_rect, 'type': 'vector', 'area': area})
+
                 for fig_id in matches:
                     rects = page.search_for(f"Figure {fig_id}") or page.search_for(f"Fig. {fig_id}")
                     if not rects: continue
                     caption_y = (rects[0].y0 + rects[0].y1) / 2
                     best_bbox, min_dist = None, float('inf')
-                    for img in img_info:
-                        if img['width'] < 50: continue
-                        img_bbox = fitz.Rect(img['bbox'])
-                        dist = abs(caption_y - ((img_bbox.y0 + img_bbox.y1) / 2))
-                        if img_bbox.y1 < caption_y: dist *= 0.6  # Image-above-caption bias
-                        if dist < min_dist: min_dist, best_bbox = dist, img_bbox
+
+                    for cand in candidates:
+                        bbox = cand['bbox']
+                        dist = abs(caption_y - ((bbox.y0 + bbox.y1) / 2))
+
+                        # ANTI-NOISE HEURISTICS
+                        if bbox.y1 < caption_y: dist *= 0.5  # Bias for image above caption
+                        if cand['area'] < (max_candidate_area * 0.15): dist *= 20.0  # Ignore small watermarks
+                        if bbox.width < 100: dist *= 5.0  # Ignore narrow text watermarks
+
+                        if dist < min_dist:
+                            min_dist, best_bbox = dist, bbox
 
                     if best_bbox:
                         rel_path, v_type = self.extract_visual(page, best_bbox, fig_id)
                         fig_hooks[fig_id] = rel_path
                         print(f"    {v_type} Found: Fig {fig_id} in {item['file']}")
 
+            # Inject links correctly inside the chapter loop
             for fig_id, rel_path in fig_hooks.items():
                 md_link = f"\n\n![Figure {fig_id}]({rel_path})\n\n"
                 pattern = re.compile(rf'(?:Figure|Fig)\s*{re.escape(fig_id)}', re.IGNORECASE)
@@ -118,6 +156,7 @@ class AdvancedImageProcessor:
 
             with open(self.output_dir / item['file'], 'w', encoding='utf-8') as f:
                 f.write(content)
+
         print(f"\nDone! Check {self.output_dir}")
 
 

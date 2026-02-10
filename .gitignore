@@ -18,3 +18,5 @@ __pycache__/
 # System Files
 .DS_Store
 
+/chapters_LLM_Engineers_Handbook/
+/final_output_LLM_Engineers_Handbook/
