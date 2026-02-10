@@ -17,7 +17,6 @@ class AdvancedImageProcessor:
         self.assets_dir.mkdir(parents=True, exist_ok=True)
 
     def is_toc_page(self, page_text, current_ch_num, md_files):
-        """Detects if a page is a Part Intro or TOC by checking future chapter density."""
         matches = 0
         for other_file in md_files:
             other_num = int(other_file[:2])
@@ -28,69 +27,54 @@ class AdvancedImageProcessor:
         return matches >= 1
 
     def find_chapter_starts(self, doc, md_files):
-        """Anchors chapters to physical pages, skipping mini-TOCs."""
         pdf_mapping = []
         last_found = 0
         search_start = max(10, int(len(doc) * 0.03))
-
-        print(f"--- ANCHORING CHAPTERS ---")
         for filename in md_files:
             ch_num = int(filename[:2])
             title = filename[3:-3].replace('_', ' ').lower()
-
             found_page = -1
             for p_idx in range(max(last_found, search_start), len(doc)):
-                page_text = doc[p_idx].get_text().lower()
-                if fuzz.partial_ratio(title, page_text) > self.threshold:
-                    if self.is_toc_page(page_text, ch_num, md_files): continue
+                if fuzz.partial_ratio(title, doc[p_idx].get_text().lower()) > self.threshold:
+                    if self.is_toc_page(doc[p_idx].get_text(), ch_num, md_files): continue
                     found_page = p_idx
                     break
-
             if found_page != -1:
-                print(f"  ✓ Ch {ch_num} anchored to PDF Page {found_page + 1}")
                 pdf_mapping.append({"num": ch_num, "file": filename, "start_page": found_page})
                 last_found = found_page + 3
-
         for i in range(len(pdf_mapping)):
             pdf_mapping[i]["end_page"] = pdf_mapping[i + 1]["start_page"] if i + 1 < len(pdf_mapping) else len(doc)
         return pdf_mapping
 
     def get_vector_clusters(self, page):
-        """Groups drawing paths into logical figure boxes."""
+        """Groups vector paths with aggressive flowchart bridging."""
         paths = page.get_drawings()
         clusters = []
         for p in paths:
             r = fitz.Rect(p["rect"])
             if r.width < 5 or r.height < 5: continue
-
             merged = False
             for i, c_rect in enumerate(clusters):
-                # Manual expansion for intersection check (fixes AttributeError)
-                check_rect = fitz.Rect(c_rect.x0 - 20, c_rect.y0 - 20, c_rect.x1 + 20, c_rect.y1 + 20)
-                if r.intersects(check_rect):
+                # 50pt bridge for complex diagrams like Fig 5.6
+                if r.intersects(fitz.Rect(c_rect.x0 - 50, c_rect.y0 - 50, c_rect.x1 + 50, c_rect.y1 + 50)):
                     clusters[i] = c_rect | r
                     merged = True
                     break
             if not merged: clusters.append(r)
-        return [c for c in clusters if c.width > 40]
+        return [c for c in clusters if c.width > 60 and c.height > 40]
 
     def extract_visual(self, page, bbox, fig_id):
-        """Prioritizes SVG for vector visuals, falls back to PNG."""
         img_name = f"fig_{fig_id.replace('.', '_')}"
         if self.use_svg:
             try:
                 svg_data = page.get_svg_image(matrix=fitz.Identity, clip=bbox)
                 if "<path" in svg_data or "<text" in svg_data:
-                    file_path = self.assets_dir / f"{img_name}.svg"
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(svg_data)
+                    with open(self.assets_dir / f"{img_name}.svg", "w") as f: f.write(svg_data)
                     return f"assets/{img_name}.svg", "SVG"
-            except Exception:
+            except:
                 pass
-
         pix = page.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72), clip=bbox + (-2, -2, 2, 2))
-        file_path = self.assets_dir / f"{img_name}.png"
-        pix.save(file_path)
+        pix.save(self.assets_dir / f"{img_name}.png")
         return f"assets/{img_name}.png", "PNG"
 
     def process(self):
@@ -99,72 +83,61 @@ class AdvancedImageProcessor:
         mapping = self.find_chapter_starts(doc, md_files)
         fig_regex = re.compile(r'(?:Figure|Fig)\s*(\d+[\.\-]\d+)', re.IGNORECASE)
 
-        print(f"\n--- EXTRACTING VISUALS (ANTI-WATERMARK MODE) ---")
+        print(f"\n--- EXTRACTING VISUALS (GEOMETRIC REJECTION) ---")
         for item in mapping:
-            md_path = self.md_dir / item['file']
-            with open(md_path, 'r', encoding='utf-8') as f:
+            with open(self.md_dir / item['file'], 'r') as f:
                 content = f.read()
-
             fig_hooks = {}
             for p_idx in range(item['start_page'], item['end_page']):
                 page = doc[p_idx]
-                matches = fig_regex.findall(page.get_text())
-                if not matches: continue
+                matches = list(fig_regex.finditer(page.get_text()))
 
-                # HYBRID CANDIDATE COLLECTION
                 candidates = []
-                max_candidate_area = 0
+                max_area = 1
                 for img in page.get_image_info():
                     r = fitz.Rect(img['bbox'])
-                    area = r.width * r.height
-                    max_candidate_area = max(max_candidate_area, area)
-                    candidates.append({'bbox': r, 'type': 'raster', 'area': area})
-                for vec_rect in self.get_vector_clusters(page):
-                    area = vec_rect.width * vec_rect.height
-                    max_candidate_area = max(max_candidate_area, area)
-                    candidates.append({'bbox': vec_rect, 'type': 'vector', 'area': area})
+                    # GEOMETRIC FILTER: If height < 15, it's a watermark line, not a figure.
+                    if r.height < 15: continue
+                    candidates.append({'bbox': r, 'type': 'raster', 'area': r.get_area()})
+                    max_area = max(max_area, r.get_area())
+                for v in self.get_vector_clusters(page):
+                    candidates.append({'bbox': v, 'type': 'vector', 'area': v.get_area()})
+                    max_area = max(max_area, v.get_area())
 
-                for fig_id in matches:
-                    rects = page.search_for(f"Figure {fig_id}") or page.search_for(f"Fig. {fig_id}")
+                for match in matches:
+                    fig_id = match.group(1)
+                    rects = page.search_for(match.group(0))
                     if not rects: continue
-                    caption_y = (rects[0].y0 + rects[0].y1) / 2
-                    best_bbox, min_dist = None, float('inf')
+                    cap_y, cap_x = (rects[0].y0 + rects[0].y1) / 2, (rects[0].x0 + rects[0].x1) / 2
 
+                    best_bbox, min_score = None, float('inf')
                     for cand in candidates:
                         bbox = cand['bbox']
-                        dist = abs(caption_y - ((bbox.y0 + bbox.y1) / 2))
-
-                        # ANTI-NOISE HEURISTICS
-                        if bbox.y1 < caption_y: dist *= 0.5  # Bias for image above caption
-                        if cand['area'] < (max_candidate_area * 0.15): dist *= 20.0  # Ignore small watermarks
-                        if bbox.width < 100: dist *= 5.0  # Ignore narrow text watermarks
-
-                        if dist < min_dist:
-                            min_dist, best_bbox = dist, bbox
+                        score = abs(cap_y - (bbox.y0 + bbox.y1) / 2) + (abs(cap_x - (bbox.x0 + bbox.x1) / 2) * 0.4)
+                        if bbox.y1 < cap_y: score *= 0.5
+                        # Aggressive penalty for tiny objects relative to the page's largest item
+                        if cand['area'] < (max_area * 0.15): score *= 100.0
+                        if score < min_score: min_score, best_bbox = score, bbox
 
                     if best_bbox:
-                        rel_path, v_type = self.extract_visual(page, best_bbox, fig_id)
-                        fig_hooks[fig_id] = rel_path
-                        print(f"    {v_type} Found: Fig {fig_id} in {item['file']}")
+                        path, v_type = self.extract_visual(page, best_bbox, fig_id)
+                        fig_hooks[fig_id] = path
+                        print(f"  ✓ {v_type} Fig {fig_id} in {item['file']}")
 
-            # Inject links correctly inside the chapter loop
-            for fig_id, rel_path in fig_hooks.items():
-                md_link = f"\n\n![Figure {fig_id}]({rel_path})\n\n"
-                pattern = re.compile(rf'(?:Figure|Fig)\s*{re.escape(fig_id)}', re.IGNORECASE)
-                if pattern.search(content):
-                    content = pattern.sub(lambda m: f"{md_link}{m.group(0)}", content, count=1)
+            # Fixed SyntaxWarning: Use a non-f-string for the replacement group
+            for fid, path in fig_hooks.items():
+                replacement = f"\n\n![Figure {fid}]({path})\n\n" + r"\g<0>"
+                content = re.sub(rf'(?:Figure|Fig)\s*{re.escape(fid)}', replacement, content, count=1)
 
-            with open(self.output_dir / item['file'], 'w', encoding='utf-8') as f:
+            with open(self.output_dir / item['file'], 'w') as f:
                 f.write(content)
-
-        print(f"\nDone! Check {self.output_dir}")
+        print("✅ Success.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('pdf')
-    parser.add_argument('md_dir')
-    parser.add_argument('-o', '--out', default='rag_ready_book')
-    parser.add_argument('--no-svg', action='store_false', dest='use_svg')
-    args = parser.parse_args()
-    AdvancedImageProcessor(args.pdf, args.md_dir, args.out, use_svg=args.use_svg).process()
+    parser.add_argument('pdf');
+    parser.add_argument('md_dir');
+    parser.add_argument('-o', '--out', default='rag_output')
+    args = parser.parse_args();
+    AdvancedImageProcessor(args.pdf, args.md_dir, args.out).process()
