@@ -1,0 +1,20 @@
+/chapters/
+/chapters_with_assets/
+/md_books/
+/pdf_books/
+/final_output/
+
+# Python Environment
+/.venv/
+/venv/
+.env
+__pycache__/
+*.py[cod]
+
+# PyCharm/IntelliJ
+.idea/
+*.iml
+
+# System Files
+.DS_Store
+
